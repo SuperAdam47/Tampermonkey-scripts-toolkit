@@ -326,21 +326,6 @@
   }
 
   function press(el) {
-    const rect = el.getBoundingClientRect();
-    const opts = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      button: 0
-    };
-    el.dispatchEvent(new PointerEvent('pointerover', opts));
-    el.dispatchEvent(new MouseEvent('mouseover', opts));
-    el.dispatchEvent(new PointerEvent('pointerdown', opts));
-    el.dispatchEvent(new MouseEvent('mousedown', opts));
-    el.dispatchEvent(new PointerEvent('pointerup', opts));
-    el.dispatchEvent(new MouseEvent('mouseup', opts));
     el.click();
   }
 

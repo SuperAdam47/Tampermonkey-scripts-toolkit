@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Follow (daily limit)
 // @namespace    local.tampermonkey.github-follow
-// @version      1.0.3
+// @version      1.0.7
 // @description  Follow accounts on GitHub followers/following pages, then continue to the next page.
 // @match        https://github.com/*
 // @run-at       document-idle
@@ -60,6 +60,8 @@
   let running = false;
   let abort = null;
   let warnedHidden = false;
+  let waitLine = null;
+  const doneUsers = new Set();
   const ui = {};
 
   function clampInt(value, min, max, fallback) {
@@ -123,43 +125,83 @@
     }
   }
 
-  function buttonLabel(form) {
-    const btn = form.querySelector('button, input[type="submit"]');
-    return ((btn && (btn.value || btn.textContent)) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  function listRoot() {
+    return document.querySelector('#repos-user-list-container, .application-main, main, [role="main"]')
+      || document.body;
   }
 
-  function alreadyFollowed(form) {
-    const action = form.getAttribute('action') || '';
-    const label = buttonLabel(form);
-    return /\/users\/unfollow\b/.test(action) || label === 'unfollow' || label === 'following';
+  function isVisible(el) {
+    if (!el || !el.isConnected || el.closest('#ghf-panel')) return false;
+    if (el.closest('[hidden], [aria-hidden="true"], .d-none, .hidden')) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   }
 
-  function followForms() {
-    const me = myLogin();
-    return Array.from(document.querySelectorAll('form')).filter(function (form) {
-      if (form.dataset.ghfDone === '1') return false;
-      if (alreadyFollowed(form)) return false;
+  function buttonText(btn) {
+    if (!btn) return '';
+    const aria = (btn.getAttribute('aria-label') || '').trim();
+    const value = (btn.value || '').trim();
+    const text = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+    return (text || value || aria).toLowerCase();
+  }
+
+  function formState(form, btn) {
+    const action = (form.getAttribute('action') || '').toLowerCase();
+    const text = buttonText(btn);
+    if (/\/users\/unfollow\b/.test(action) || text.indexOf('unfollow') !== -1 || text === 'following') {
+      return 'followed';
+    }
+    if (/\/users\/follow\b/.test(action) && !/\/users\/unfollow\b/.test(action)) {
+      if (text.indexOf('unfollow') !== -1) return 'followed';
+      return 'follow';
+    }
+    return '';
+  }
+
+  function followFormsOnPage() {
+    const root = listRoot();
+    return Array.from(root.querySelectorAll('form')).filter(function (form) {
       const action = form.getAttribute('action') || '';
-      if (!/\/users\/follow\b/.test(action)) return false;
-      const target = targetOf(form);
-      if (!target || target.toLowerCase() === me) return false;
-      const label = buttonLabel(form);
-      return label === 'follow';
+      return /\/users\/(?:follow|unfollow)\b/.test(action);
     });
   }
 
-  function alreadyFollowedCount() {
+  function people() {
     const me = myLogin();
-    const seen = new Set();
-    let count = 0;
-    Array.from(document.querySelectorAll('form')).forEach(function (form) {
-      if (!alreadyFollowed(form)) return;
-      const target = (targetOf(form) || buttonLabel(form)).toLowerCase();
-      if (!target || target === me || seen.has(target)) return;
-      seen.add(target);
-      count += 1;
+    const byName = new Map();
+    followFormsOnPage().forEach(function (form) {
+      const target = targetOf(form);
+      const key = target.toLowerCase();
+      if (!key || key === me || doneUsers.has(key)) return;
+      const btn = form.querySelector('button, input[type="submit"]');
+      if (!btn || !isVisible(btn)) return;
+      const state = formState(form, btn);
+      if (!state) return;
+      const current = byName.get(key);
+      if (!current || state === 'followed') {
+        byName.set(key, { target: target, key: key, form: form, btn: btn, state: state });
+      }
     });
-    return count;
+    return Array.from(byName.values());
+  }
+
+  async function waitForPeople(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (people().length) return true;
+      await sleep(400, abort && abort.signal);
+    }
+    return people().length > 0;
+  }
+
+  function followQueue() {
+    return people().filter(function (person) { return person.state === 'follow'; });
+  }
+
+  function followedOnPage() {
+    return people().filter(function (person) { return person.state === 'followed'; });
   }
 
   function nextLink() {
@@ -236,10 +278,14 @@
   }
 
   async function countdown(ms) {
+    const signal = abort && abort.signal;
     const end = Date.now() + ms;
     while (Date.now() < end) {
+      if (!running || (signal && signal.aborted)) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
       setStatus('Waiting · ' + formatDuration(end - Date.now()));
-      await sleep(Math.min(1000, end - Date.now()), abort.signal);
+      await sleep(Math.min(1000, end - Date.now()), signal);
     }
   }
 
@@ -252,6 +298,7 @@
     }).join(':');
     line.textContent = stamp + '  ' + message;
     ui.log.appendChild(line);
+    return line;
     while (ui.log.childNodes.length > 80) ui.log.removeChild(ui.log.firstChild);
     ui.log.scrollTop = ui.log.scrollHeight;
   }
@@ -265,15 +312,17 @@
   }
 
   function setStatus(text) {
-    if (ui.status) ui.status.textContent = text;
+    if (!ui.status) return;
+    if (!running && text.indexOf('Waiting') === 0) return;
+    ui.status.textContent = text;
   }
 
   function updatePanel() {
     if (!ui.today) return;
     const daily = loadDaily();
-    const left = followForms().length;
+    const left = followQueue().length;
     ui.today.textContent = daily.follows + ' / ' + settings.dailyMax;
-    ui.screen.textContent = left + ' to follow · ' + alreadyFollowedCount() + ' already followed, skipped'
+    ui.screen.textContent = left + ' to follow · ' + followedOnPage().length + ' already followed, skipped'
       + (nextLink() ? ' · next page ready' : ' · no next page');
     const avg = (Number(settings.delayMinMin) + Number(settings.delayMaxMin)) / 2;
     ui.pace.textContent = 'Full day of ' + settings.dailyMax + ' is about ' + formatHours(avg * settings.dailyMax) + '.';
@@ -313,7 +362,7 @@
       if (btn.type === 'submit') btn.value = 'Unfollow';
       btn.textContent = 'Unfollow';
     }
-    form.dataset.ghfDone = '1';
+    doneUsers.add(target.toLowerCase());
     const action = form.getAttribute('action') || '';
     form.setAttribute('action', action.replace('/users/follow', '/users/unfollow'));
     return target;
@@ -329,6 +378,8 @@
 
     log('Started. Today ' + loadDaily().follows + '/' + settings.dailyMax
       + '. Gap ' + settings.delayMinMin + '–' + settings.delayMaxMin + ' min.');
+    setStatus('Loading page…');
+    await waitForPeople(8000);
     setStatus('Starting · 3s');
     await countdown(3000);
 
@@ -343,9 +394,23 @@
         return;
       }
 
-      const forms = followForms();
       updatePanel();
-      if (!forms.length) {
+      const skipped = followedOnPage();
+      skipped.forEach(function (person) { doneUsers.add(person.key); });
+      if (skipped.length) {
+        log('Skipped ' + skipped.length + ' already followed (' + skipped.map(function (person) {
+          return '@' + person.target;
+        }).join(', ') + '). No wait.');
+        updatePanel();
+      }
+      if (!followQueue().length) {
+        if (!people().length) {
+          setStatus('Loading user list…');
+          const loaded = await waitForPeople(8000);
+          if (loaded) continue;
+          log('No user buttons found on this page yet.');
+        }
+        if (followQueue().length) continue;
         const next = nextLink();
         if (!next) {
           store.set('running', false);
@@ -354,15 +419,28 @@
           notify('Finished this list.');
           return;
         }
+        if (!followedOnPage().length && !people().length) {
+          store.set('running', false);
+          setStatus('Stopped — page not recognized');
+          log('Stopped. Could not read Follow/Unfollow buttons on this page. Reload and try again.');
+          notify('Could not read buttons on this page.');
+          return;
+        }
         store.set('running', true);
         setStatus('Opening the next page…');
-        log('Page done. Opening the next page.');
+        log('This page is done. Opening the next page.');
         openNext(next);
         return;
       }
 
-      const form = forms[0];
-      const target = targetOf(form);
+      const person = followQueue()[0];
+      const form = person.form;
+      const target = person.target;
+      if (formState(form, person.btn) !== 'follow') {
+        doneUsers.add(person.key);
+        log('Skipped @' + target + ' (already followed). No wait.');
+        continue;
+      }
       setStatus('Follow @' + target);
       try {
         await followOne(form);
@@ -380,12 +458,13 @@
           return;
         }
         const gap = randomGap();
-        log('Next action in ' + formatDuration(gap) + '.');
+        waitLine = log('Next action in ' + formatDuration(gap) + '.');
         await countdown(gap);
+        waitLine = null;
       } catch (err) {
         if (err && err.name === 'AbortError') throw err;
         failures += 1;
-        form.dataset.ghfDone = '1';
+        doneUsers.add(target.toLowerCase());
         log('Could not follow @' + target + ' (' + ((err && err.message) || err) + ').');
         if (failures >= 3) {
           store.set('running', false);
@@ -410,6 +489,7 @@
     }
     running = true;
     warnedHidden = false;
+    doneUsers.clear();
     store.set('running', true);
     abort = new AbortController();
     updatePanel();
@@ -425,11 +505,15 @@
   }
 
   function stopRun() {
-    if (abort) abort.abort();
     running = false;
+    if (abort) abort.abort();
     store.set('running', false);
+    if (waitLine) {
+      waitLine.textContent = waitLine.textContent.replace(/Next action in .*/, 'Wait cancelled.');
+      waitLine = null;
+    }
     setStatus('Stopped');
-    log('Stopped.');
+    log('Stopped. No follow is scheduled.');
     updatePanel();
   }
 

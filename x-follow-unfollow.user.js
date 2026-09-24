@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Follow / Unfollow (daily limit)
 // @namespace    local.tampermonkey.x-follow
-// @version      1.0.0
+// @version      1.0.1
 // @description  Follow or unfollow accounts on X with a daily cap and a random delay between each action.
 // @match        https://x.com/*
 // @match        https://twitter.com/*

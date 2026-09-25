@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Follow (daily limit)
 // @namespace    local.tampermonkey.github-follow
-// @version      1.0.7
+// @version      1.0.8
 // @description  Follow accounts on GitHub followers/following pages, then continue to the next page.
 // @match        https://github.com/*
 // @run-at       document-idle
@@ -168,13 +168,13 @@
     });
   }
 
-  function people() {
+  function scanPage() {
     const me = myLogin();
     const byName = new Map();
     followFormsOnPage().forEach(function (form) {
       const target = targetOf(form);
       const key = target.toLowerCase();
-      if (!key || key === me || doneUsers.has(key)) return;
+      if (!key || key === me) return;
       const btn = form.querySelector('button, input[type="submit"]');
       if (!btn || !isVisible(btn)) return;
       const state = formState(form, btn);
@@ -187,13 +187,17 @@
     return Array.from(byName.values());
   }
 
+  function people() {
+    return scanPage().filter(function (person) { return !doneUsers.has(person.key); });
+  }
+
   async function waitForPeople(ms) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
-      if (people().length) return true;
+      if (scanPage().length) return true;
       await sleep(400, abort && abort.signal);
     }
-    return people().length > 0;
+    return scanPage().length > 0;
   }
 
   function followQueue() {
@@ -201,7 +205,11 @@
   }
 
   function followedOnPage() {
-    return people().filter(function (person) { return person.state === 'followed'; });
+    return scanPage().filter(function (person) { return person.state === 'followed'; });
+  }
+
+  function pendingFollowOnPage() {
+    return scanPage().filter(function (person) { return person.state === 'follow'; });
   }
 
   function nextLink() {
@@ -320,9 +328,9 @@
   function updatePanel() {
     if (!ui.today) return;
     const daily = loadDaily();
-    const left = followQueue().length;
+    const left = pendingFollowOnPage().length;
     ui.today.textContent = daily.follows + ' / ' + settings.dailyMax;
-    ui.screen.textContent = left + ' to follow · ' + followedOnPage().length + ' already followed, skipped'
+    ui.screen.textContent = left + ' to follow · ' + followedOnPage().length + ' already followed on this page'
       + (nextLink() ? ' · next page ready' : ' · no next page');
     const avg = (Number(settings.delayMinMin) + Number(settings.delayMaxMin)) / 2;
     ui.pace.textContent = 'Full day of ' + settings.dailyMax + ' is about ' + formatHours(avg * settings.dailyMax) + '.';
@@ -395,22 +403,24 @@
       }
 
       updatePanel();
-      const skipped = followedOnPage();
+      const skipped = followedOnPage().filter(function (person) { return !doneUsers.has(person.key); });
       skipped.forEach(function (person) { doneUsers.add(person.key); });
       if (skipped.length) {
-        log('Skipped ' + skipped.length + ' already followed (' + skipped.map(function (person) {
-          return '@' + person.target;
-        }).join(', ') + '). No wait.');
+        log('Skipped ' + skipped.length + ' already followed. No wait.');
         updatePanel();
       }
       if (!followQueue().length) {
-        if (!people().length) {
+        if (pendingFollowOnPage().length) {
+          pendingFollowOnPage().forEach(function (person) { doneUsers.delete(person.key); });
+          continue;
+        }
+        if (!scanPage().length) {
           setStatus('Loading user list…');
           const loaded = await waitForPeople(8000);
           if (loaded) continue;
           log('No user buttons found on this page yet.');
         }
-        if (followQueue().length) continue;
+        if (followQueue().length || pendingFollowOnPage().length) continue;
         const next = nextLink();
         if (!next) {
           store.set('running', false);
@@ -419,14 +429,8 @@
           notify('Finished this list.');
           return;
         }
-        if (!followedOnPage().length && !people().length) {
-          store.set('running', false);
-          setStatus('Stopped — page not recognized');
-          log('Stopped. Could not read Follow/Unfollow buttons on this page. Reload and try again.');
-          notify('Could not read buttons on this page.');
-          return;
-        }
         store.set('running', true);
+        doneUsers.clear();
         setStatus('Opening the next page…');
         log('This page is done. Opening the next page.');
         openNext(next);
